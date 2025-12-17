@@ -1,0 +1,368 @@
+1. Team Management Services
+These functions handle team creation, joining, and roster management.
+1.1 Create Team
+Function: createTeam
+API Path: POST /api/teams
+Purpose: Allows a user to create a new team. It automatically assigns the creator as the Leader, generates a unique Join Code, and handles unique name constraints .
+Request Body:
+JSON
+{ "name": "Hackers United" }
+
+Response (201 Created):
+JSON
+{
+  "message": "Team created successfully!",
+  "team": { "id": "...", "name": "Hackers United" },
+  "joinCode": "A1B2C3"
+}
+Error Response: 409 Conflict: "You are already part of a team." or "Team name already taken."
+1.2 Join Team
+Function: joinTeam
+API Path: POST /api/teams/join
+Purpose: Allows a user to join an existing team using a Join Code. It enforces the MAX_TEAM_SIZE (4 members). If the team becomes full (4/4), it automatically sets is_finalized = true .
+Request Body:
+JSON
+{ "joinCode": "A1B2C3" }
+
+Response (200 OK):
+JSON
+{ "message": "Successfully joined team: Hackers United" }
+Error Response: 404 Not Found: "Invalid join code." 
+409 Conflict: "Team is full." or "You are already in a team."
+1.3 Get Team Details (My Team)
+Function: getMyTeam
+API Path: GET /api/teams/my-team
+Purpose: Fetches the full details of the logged-in user's team, including the roster (members) and their profiles. This effectively covers the getTeamDetails requirement 
+Response (200 OK):
+JSON
+{
+  "team": {
+    "id": "...",
+    "name": "...",
+    "join_code": "...",
+    "members": [
+      { "user": { "email": "...", "role": "participant", "profile": { "first_name": "..." } } }
+    ]
+  }
+}
+Error Response: 200 OK (with null): { "message": "User is not in a team", "team": null }
+1.4 Add Team Member (Invite Flow)
+Function: sendNewInvite
+API Path: POST /api/team/member/add (Implemented as invite)
+Purpose: Instead of adding a member directly (which is insecure), we implemented an Invite Flow. The leader sends an email with a unique token. The logic validates that the team is not full before sending .
+Request Body:
+JSON
+{ "email": "friend@example.com" }
+
+Response (200 OK):
+JSON
+{ "message": "Invitation sent to friend@example.com" }
+Error Response: 403 Forbidden: "Only the Team Leader can invite members." 
+409 Conflict: "Team is already full."
+1.5 Remove Team Member
+Function: removeMember
+API Path: DELETE /api/team/:teamId/member/remove
+Purpose: Allows the Leader to remove a member.
+Rule 1: Only Leader can perform this.
+Rule 2: Leader cannot remove themselves (must transfer leadership first).
+Rule 3: Cannot violate MIN_MEMBERS constraint .
+Request Body:
+JSON
+{ "memberId": "user-uuid-to-remove" }
+
+Response (200 OK):
+JSON
+{ "message": "Member removed successfully." }
+Error Response: 400 Bad Request: "Cannot remove member. Minimum team size..."
+1.6 Update Team Details
+Function: updateTeamDetailsController
+API Path: PATCH /api/team/update
+Purpose: Allows the Leader to update the Team Name or Project Category .
+Request Body:
+JSON
+{ "name": "New Name", "project_category": "AI" }
+Response (200 OK):
+JSON
+{ "message": "Team details updated successfully.", "team": {...} }
+
+Future Requirements:
+
+Security (Join Code)
+Implementation: we use a short 6-char Hex code (crypto.randomBytes(3))
+Trade-off: Hex codes (0-9, A-F) are harder to read than alphanumeric. Improvement: Use a library like nanoid with a custom alphabet (ABCDEFGHJKLMNPQRSTUVWXYZ23456789) to avoid ambiguous characters like I, l, 1, 0, O.
+Data Integrity (Locking)
+Implementation: When count + 1 === MAX, you set is_finalized = true.
+Race Condition: If two users use the join code at the exact same millisecond, both might pass the count < 4 check. Improvement: Add a Database Constraint or Trigger that prevents inserting into TeamMembers if the count > 4.
+Event Locking
+Implementation: fetch Settings on every request to check the deadline.
+Performance: Since the deadline rarely changes, this adds a small DB overhead to every removal attempt. Improvement: In a high-traffic system, cache the submission_deadline in Redis or memory (with a 5-minute TTL) to save that database read.
+
+2. Submission Services
+These functions handle the core project upload, security scanning, and locking mechanism.
+2.1 Create/Upload Submission (Draft)
+Function: handleSubmissionDraft
+API Path: POST /api/submissions
+Purpose: Creates a new submission draft or updates an existing one.
+Validation 1: Validates file type (.zip only) and size (10MB limit).
+Validation 2 (New): Checks Settings.submission_deadline. If the current time is past the global deadline, the upload is rejected.
+Process: Integrates with FileService for AV scanning and storage.
+Request Body (Multipart/Form-Data):
+title: string (required)
+description: string
+repoUrl: string
+zipFile: File (binary, .zip only)
+Response (201 Created):
+JSON
+{
+  "message": "Submission draft saved successfully.",
+  "submission": { "id": "...", "title": "My Project", "status": "draft" }
+}
+Error Response:
+403 Forbidden: "Upload failed: Security risk detected (Virus)."
+403 Forbidden: "Submission deadline has passed. New uploads are not allowed."
+400 Bad Request: "Invalid file type. Only .zip archives are permitted."
+2.2 Finalize Submission (Lock)
+Function: finalizeSubmission
+API Path: PUT /api/submissions/:id/finalize
+Purpose: The official "Turn In" button.
+Action: Sets status to 'submitted' and records the timestamp.
+Validation: strictly enforces that the current time is before the submission_deadline.
+Request Parameters: id (Submission UUID)
+Response (200 OK):
+JSON
+{
+  "message": "Submission finalized!",
+  "submission": { "status": "submitted", "submitted_at": "..." }
+}
+Error Response:
+403 Forbidden: "Only the Team Leader can finalize the submission."
+403 Forbidden: "Cannot finalize: The submission deadline has passed."
+2.3 Get Submission Details
+Function: getSubmissionDetails
+API Path: GET /api/submissions/:id
+Purpose: Retrieves submission details. Includes strict role-based access control:
+Admins/Judges: Can view any submission.
+Participants: Can only view their own team's submission.
+Response (200 OK):
+JSON
+{ "submission": { "title": "...", "repo_url": "..." } }
+Error Response:
+403 Forbidden: "You can only view your own team's submission."
+2.4 Update Submission Details
+Function: updateSubmissionDetailsController
+API Path: PATCH /api/submissions/:id
+Purpose: Allows the Team Leader to edit metadata (Title, Description, Links).
+Constraint 1: Cannot edit if status is 'submitted' (Finalized).
+Constraint 2: Cannot edit if the global submission_deadline has passed.
+Request Body:
+JSON
+{ "title": "New Title", "repoUrl": "https://github.com/new" }
+Response (200 OK):
+JSON
+{ "message": "Submission updated successfully.", "submission": {...} }
+Error Response:
+403 Forbidden: "Cannot edit a finalized submission."
+403 Forbidden: "Submission deadline has passed."
+
+
+Future Requirements:
+Security (AV Scan): Implementation: the file in memory (multer.memoryStorage) and pass the buffer to FileService for scanning.Scalability Risk: Loading a 10MB file into RAM for every user works for small hackathons. For 10,000 users, this will cause Heap Out of Memory. Improvement: Use Streams. Stream the upload directly to a temporary disk location or S3, and trigger an AWS Lambda function to scan it asynchronously.
+Data Integrity: Implementation: updateSubmissionDetailsController checks eq("team_id", details.teamId).Safety: This is excellent. It ensures that even if a user guesses another team's valid Submission ID, the query will fail because the team_id doesn't match their own.
+3. Dashboard Services
+This service acts as the "Home Page" aggregator, pulling status from multiple modules into a single, lightweight response to reduce frontend loading times.
+3.1 Get Participant Dashboard
+Function: getParticipantDashboardController
+API Path: GET /api/participant/dashboard
+Purpose: Aggregates critical status information for the user's home screen .
+Team Status: Returns verification status, member count, and whether the user is the leader.
+Submission State: Checks if a submission exists and if it is finalized (submitted) or still a draft.
+Notifications: Returns a summary count (Total vs. Unread) and the latest headline.
+Deadlines: Returns key upcoming dates.
+Request Body: None.
+Response (200 OK):
+JSON
+{
+  "dashboard": {
+    "teamStatus": {
+      "id": "team-uuid",
+      "name": "Team Alpha",
+      "status": "verified",
+      "memberCount": 4,
+      "isLeader": true
+    },
+    "submissionStatus": {
+      "state": "draft", // or 'submitted' / 'no_submission'
+      "submissionId": "sub-uuid"
+    },
+    "announcementsSummary": {
+      "total": 5,
+      "unreadCount": 2,
+      "latestTitle": "Lunch is served!"
+    },
+    "upcomingDeadlines": [
+      { "name": "Submission Lock", "date": "2025-12-15T23:59:00Z" }
+    ]
+  }
+}
+Error Response: 500 Server Error: "Server Error"
+4. Notification & Event Services
+These functions handle the distribution of announcements, read-receipts, and the retrieval of official event rules.
+4.1 Get Notifications
+Function: getNotificationsController
+API Path: GET /api/notifications
+Purpose: Fetches official announcements targeted to the user .
+Logic: Uses getRelevantNotifications service to apply Context-Based Filtering (matches User Role, City, and Team against the notification's target_criteria).
+Read Status: Manually joins UserNotifications to add an is_read flag to each item.
+Response (200 OK):
+JSON
+{
+  "message": "Notifications retrieved.",
+  "notifications": [
+    {
+      "id": "notif-uuid",
+      "title": "Welcome to HackOnX",
+      "content": "...",
+      "is_read": false,
+      "created_at": "..."
+    }
+  ],
+  "count": 1
+}
+4.2 Mark Notification Read
+Function: markNotificationReadController
+API Path: PATCH /api/notifications/read
+Purpose: Marks specific announcements as "read" to clear the "New" badge .
+Logic: Performs an upsert on the UserNotifications junction table.
+Request Body:
+JSON
+{
+  "notificationIds": ["notif-uuid-1", "notif-uuid-2"]
+}
+Response (200 OK):
+JSON
+{ "message": "Notifications marked as read." }
+4.3 Get Event Info
+Function: getEventInfoController
+API Path: GET /api/event/info
+Purpose: Retrieves the official "Rule Book" and configuration .
+Dynamic: Fetches the real-time submission_deadline and max_team_size from the Settings database table.
+Static: Returns standard rules, judging weights, and venue info (currently hardcoded).
+Response (200 OK):
+JSON
+{
+  "eventInfo": {
+    "event_name": "HackOnX",
+    "submission_deadline": "2025-12-31T23:59:00Z",
+    "max_team_size": 4,
+    "rules_url": "http://hackonx.com/rules",
+    "venue": "Online / Virtual"
+  }
+}
+5. User Settings Services
+These functions allow authenticated users to manage their account security and communication preferences.
+5.1 Update Password
+Function: updatePasswordController
+API Path: PATCH /api/auth/settings/password
+Purpose: Securely updates the user's password .
+Security: Verifies the oldPassword hash before allowing a change.
+Request Body:
+JSON
+{
+  "oldPassword": "currentPassword123",
+  "newPassword": "newSecurePassword!@#"
+}
+Response (200 OK):
+JSON
+{ "message": "Password updated successfully. Please log in again." }
+Error Response: 401 Unauthorized: "Invalid old password."
+5.2 Update Email Preferences
+Function: updateEmailPreferencesController
+API Path: PATCH /api/auth/settings/email-preferences
+Purpose: Toggles the user's consent for marketing emails (allow_marketing column) .
+Request Body:
+JSON
+{
+  "allowMarketingEmails": false
+}
+Response (200 OK):
+JSON
+{
+  "message": "Email preferences updated successfully.",
+  "allowMarketingEmails": false
+}
+1. Notification
+Status: To Be Implemented. Currently, finalizeSubmission returns success but sends no email.
+UX Improvement: Trigger sendEmail inside finalizeSubmission. Subject: "Receipt: [Project Name] Submitted". This confirms to the user that the system actually received their work.
+2. Performance (Dashboard)
+Implementation: getTeamDataForDashboard executes a single nested query (Teams -> Members -> Submissions).
+Optimization: This is highly efficient. It avoids the "N+1 Problem" where fetching member details would require separate queries. Keep this pattern if we scale.
+3. Context Filtering
+Implementation: getRelevantNotifications fetches all role-based alerts and filters by City/Team in memory (Node.js).
+Scalability: For 100k users, filtering in memory is fine because the number of active announcements is usually small (< 50). If we have 10,000 announcements, move this logic to a Postgres View.
+4. Settings Source
+Implementation: getEventInfo mixes DB data (deadlines) with static JSON (rules).
+Maintainability: This "Hybrid Approach" is perfect for MVPs. It allows us to change the deadline instantly (DB) without needing a full CMS for static text rules.
+
+
+Participant Portal (Auth, Teams, Submissions, Settings)
+
+This documentation details the architecture, security measures, and endpoints implemented for the Participant Portal, ensuring clarity on business logic and database interactions.
+
+1. Security & Core Architecture
+
+The entire portal is secured by multiple layers of middleware and database policies:
+
+Authentication & Validation: All user sign-ups are protected by reCAPTCHA verification (using Google's API) and strong backend form validation (express-validator) enforced before database access.
+Role-Based Access Control (RBAC): Middleware (verifyAuthToken and requireRole) enforces that only participant users can access team creation, submission posting, and member removal.
+File Security: File uploads (ZIP submissions) are processed in-memory by Multer, subjected to an external Antivirus scan (VirusTotal), and then uploaded to secure Supabase Storage.
+
+2. Team Management Module
+
+This module handles team formation, invites, and membership rules.
+Viewing Team Details
+GET /api/teams/my-details : Participants can view their full team object, including all nested member and profile details, using the endpoint. 
+ GET /api/teams/:teamId : Admins and Judges can fetch details for a specific team ID via.
+Updating Team Details
+PATCH /api/teams/update :  endpoint allows the Team Leader (Leader-Only) to update mutable team fields, such as the team name.
+Managing Team Members
+Adding Members: 
+POST /api/teams/member/add : endpoint sends an invite email to a potential member. Critical logic checks the team size (maximum of 4 members) before sending the invitation.
+
+
+
+Removing Members: 
+DELETE /api/teams/:teamId/member/remove :  endpoint is Leader-Only. It enforces a critical logic rule: it prevents removal if the action would drop the team size below the required minimum of 2 members.
+
+3. Submission Module
+
+Upload Submission: 
+POST /api/submissions : endpoint creates or updates a project draft. Key logic handles multipart/form-data, initiates an Antivirus scan, uploads the ZIP file to Supabase Storage, and saves the zip_storage_path and repo_url to the database.
+Finalize Submission: 
+PUT /api/submissions/:id/finalize : endpoint is Leader-Only and locks the submission. The critical logic sets the status to 'submitted' and records the submitted_at timestamp.
+Viewing and Updating Submissions
+Get Submission: 
+GET /api/submissions/:id : endpoint fetches a specific submission's metadata, restricted to team members, Admins, or Judges.
+Update Submission: 
+PATCH /api/submissions/:id : endpoint allows updates to non-finalized submission details (e.g., title, description). Critical logic strictly blocks any updates if the submission status is already 'submitted'.
+
+4. Event & User Settings Modules
+
+These endpoints provide necessary information and self-service user management.
+Information Aggregation and General Details
+Participant Dashboard Aggregation: 
+ GET /api/participant/dashboard : an Aggregation Endpoint that fetches and consolidates team status, submission status, deadlines, and notification summary into one payload for the dashboard view.
+General Event Info: 
+GET /api/event/info endpoint returns static event details (timeline, rules, judging criteria).
+
+Notifications Management
+Get Notifications: 
+GET /api/notifications : endpoint fetches announcements relevant to the user's role. It uses a complex join to include the user's is_read status from the UserNotifications table.
+Mark Notification Read: 
+PATCH /api/notifications/read : endpoint marks one or more notifications as read using an upsert operation on the UserNotifications table.
+User Settings and Security
+Update Password: 
+PATCH /api/auth/settings/password endpoint requires security logic to validate the oldPassword (using bcrypt.compare) before hashing and persisting the newPassword.
+Update Email Preferences: 
+PATCH /api/auth/settings/email-preferences endpoint toggles the allow_marketing boolean field on the Users table.
+
+
